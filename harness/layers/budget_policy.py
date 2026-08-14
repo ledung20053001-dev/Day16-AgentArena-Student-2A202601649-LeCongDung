@@ -64,6 +64,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from arena.model import FINALIZE_SENTINEL
 from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
 
@@ -76,6 +78,12 @@ NUDGE = (
     "Ngân sách công cụ đã hết. Hãy trả lời ngay bằng bằng chứng đang có, "
     f"không gọi thêm công cụ nào nữa. {FINALIZE_SENTINEL}"
 )
+
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_STOP_WORDS = {
+    "có", "của", "cho", "đã", "đang", "được", "là", "một", "nào",
+    "như", "phải", "theo", "thì", "trong", "và", "về", "với",
+}
 
 
 class BudgetPolicy(Middleware):
@@ -91,13 +99,39 @@ class BudgetPolicy(Middleware):
         #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
         #  sách -> chưa bao giờ cạn. Ngược lại:
         #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
         # TODO (§3): khoảng 4-6 dòng.
         #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
         #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not self._spent(ctx):
+            return messages
+        terms = {
+            word.lower() for word in _WORD_RE.findall(ctx.question)
+            if len(word) > 2 and word.lower() not in _STOP_WORDS
+        }
+        ranked = []
+        seen = set()
+        for line in ctx.observed_text.splitlines():
+            line = line.strip()
+            if not 30 <= len(line) <= 800 or line in seen:
+                continue
+            overlap = len(terms & {w.lower() for w in _WORD_RE.findall(line)})
+            if overlap:
+                ranked.append((overlap, len(line), line))
+                seen.add(line)
+        evidence = [line for _, _, line in sorted(ranked, reverse=True)[:6]]
+        focus = NUDGE
+        if evidence:
+            focus += (
+                "\nCác dòng bằng chứng nguyên văn liên quan nhất đã đọc:\n- "
+                + "\n- ".join(evidence)
+                + "\nHãy chọn dòng trả lời đúng câu hỏi, chép nguyên văn vào claim và "
+                  "gắn đúng doc_id xuất hiện trong quan sát tương ứng."
+            )
+        return messages + [{"role": "user", "content": focus}]
 
     def wrap_tool_call(self, ctx, call, name, args):
         # TODO (§3): khoảng 4-6 dòng.
@@ -106,4 +140,10 @@ class BudgetPolicy(Middleware):
         #     ToolResult(ok=False, content="", error="<lý do>").
         #     Không calling through chính là cách một lớp middleware
         #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if not self._spent(ctx):
+            return call(name, args)
+        return ToolResult(
+            ok=False,
+            content="",
+            error="ngân sách công cụ đã cạn; cần chốt FINAL",
+        )

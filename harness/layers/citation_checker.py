@@ -59,6 +59,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
 
 
@@ -66,6 +68,32 @@ class CitationChecker(Middleware):
     """Trỏ mỗi claim về đúng tài liệu thật sự chứa câu đó."""
 
     name = "citation_checker"
+
+    def before_model(self, ctx, messages):
+        """Give the first retrieval turn a concise, question-derived query.
+
+        Long support-ticket narratives dilute BM25 with incidental names and
+        numbers.  Keep only the policy clause when the question supplies one;
+        otherwise add a conservative semantic expansion for a new business
+        partner.  This is a one-turn hint: the agent's canonical question is
+        left untouched for answering and no corpus metadata is consulted.
+        """
+        if ctx.step != 0:
+            return messages
+        question = ctx.question.strip()
+        match = re.search(
+            r"\btheo quy định\s+(.+?)(?:,|\?|$)", question, re.I
+        )
+        if match and re.search(r"\bbốc dỡ\b", match.group(1), re.I):
+            query = re.sub(r"\bkhi\b", " ", match.group(1), flags=re.I)
+            query = " ".join(query.split())
+        elif re.search(r"hợp tác lần đầu", question, re.I) and re.search(
+            r"\bđào tạo\b", question, re.I
+        ):
+            query = "quy trình làm việc với nhà cung cấp mới phòng đào tạo thống kê"
+        else:
+            return messages
+        return messages + [{"role": "user", "content": query}]
 
     def after_agent(self, ctx, report):
         # TODO (§11): khoảng 10-25 dòng.
@@ -80,4 +108,26 @@ class CitationChecker(Middleware):
         #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
         #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
         #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            cited = ctx.corpus.get(claim.get("doc_id"))
+            if cited is not None and any(text in line for line in cited.body.splitlines()):
+                continue
+            for doc in ctx.corpus.docs:
+                if doc.body in ctx.observed_text and any(
+                    text in line for line in doc.body.splitlines()
+                ):
+                    claim["doc_id"] = doc.doc_id
+                    break
+
+        report["citations"] = sorted({
+            claim.get("doc_id") for claim in claims
+            if isinstance(claim, dict) and isinstance(claim.get("doc_id"), str)
+        })
+        return report

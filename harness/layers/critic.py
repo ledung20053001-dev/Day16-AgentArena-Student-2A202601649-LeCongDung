@@ -91,4 +91,39 @@ class Critic(Middleware):
         #     claims = [], citations = [], và viết lại "answer" nói rõ là
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept = []
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            for index in range(len(text)):
+                if not text.startswith(" và ", index):
+                    continue
+                halves = (text[:index].strip(), text[index + 4:].strip())
+                sources = []
+                for half in halves:
+                    docs = [doc for doc in ctx.corpus.docs if half and half in doc.body and doc.body in ctx.observed_text]
+                    sources.append(docs)
+                pair = next(((a, b) for a in sources[0] for b in sources[1] if a.doc_id != b.doc_id), None)
+                if pair:
+                    kept.extend({"text": half, "doc_id": doc.doc_id} for half, doc in zip(halves, pair))
+                    report["abstain"] = True
+                    break
+
+        report["claims"] = kept
+        report["citations"] = sorted({claim["doc_id"] for claim in kept if isinstance(claim.get("doc_id"), str)})
+        if not kept:
+            report.update(
+                abstain=True,
+                claims=[],
+                citations=[],
+                answer="Không đủ căn cứ trong các tài liệu đã đọc để trả lời.",
+            )
+        return report

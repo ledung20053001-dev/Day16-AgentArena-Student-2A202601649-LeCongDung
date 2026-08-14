@@ -80,6 +80,35 @@ from arena.runner import (  # noqa: E402
 
 SCHEMA = "arena-scores/1"
 DEFAULT_OUT = LAB_ROOT / "runs" / "practice.json"
+DOTENV_PATH = LAB_ROOT / ".env"
+
+
+def load_dotenv(path: Path = DOTENV_PATH) -> None:
+    """Load simple KEY=VALUE settings without adding a dependency.
+
+    Existing process variables win over values from the file.  Gemini's
+    conventional names are accepted as aliases for the ARENA_* variables
+    consumed by ``RealModel``.
+    """
+    if path.is_file():
+        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, value)
+
+    aliases = {
+        "ARENA_API_KEY": "GEMINI_API_KEY",
+        "ARENA_MODEL": "GEMINI_MODEL_NAME",
+    }
+    for arena_name, provider_name in aliases.items():
+        provider_value = os.environ.get(provider_name)
+        if provider_value:
+            os.environ.setdefault(arena_name, provider_value)
 
 #: Thứ tự cài đặt năm lớp — xem `harness/middleware.py`.
 STACK_ORDER = (
@@ -129,7 +158,12 @@ def build_model(kind: str, corpus: Corpus, seed: int, timeout: float):
     if kind == "mock":
         return MockModel(corpus=corpus, seed=seed)
     try:
-        return RealModel.from_env(timeout=timeout)
+        base_url = os.environ.get("ARENA_BASE_URL", "")
+        from harness.real_model import GeminiModel, RetryingRealModel
+
+        if "generativelanguage.googleapis.com" in base_url.lower():
+            return GeminiModel.from_env(timeout=timeout)
+        return RetryingRealModel.from_env(timeout=timeout)
     except RealModelError as exc:
         raise SystemExit(f"\n{exc}\n")
 
@@ -297,6 +331,10 @@ def main(argv=None) -> int:
                         help="public | đường dẫn tới một file brief bạn tự viết")
     parser.add_argument("--brief", default=None, help="chỉ chạy một brief_id")
     parser.add_argument("--model", default="mock", choices=("mock", "real"))
+    parser.add_argument("--env-file", default=None,
+                        help="file KEY=VALUE cho đường model thật, ví dụ .env")
+    parser.add_argument("--model-timeout", type=float, default=60.0,
+                        help="timeout cho mỗi lần POST model thật (giây)")
     parser.add_argument("--layers", default="all",
                         help='"all", "none", hoặc "critic,retry"')
     parser.add_argument("--seed", type=int, default=11, help="seed gốc (mỗi brief +1)")
@@ -318,6 +356,8 @@ def main(argv=None) -> int:
                         help="thoát khác 0 nếu không có model_call nào chứa FINAL")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
+    if args.env_file:
+        load_dotenv(Path(args.env_file))
 
     briefs, set_name = load_brief_set(args.briefs)
     if args.brief:
@@ -356,7 +396,7 @@ def main(argv=None) -> int:
     for index, brief in enumerate(briefs):
         seed = derive_seed(args.seed, index)
         layers, _ = build_middleware(args.layers)
-        model = build_model(args.model, corpus, seed, timeout=60.0)
+        model = build_model(args.model, corpus, seed, timeout=args.model_timeout)
         result = run_brief(
             brief, model=model, corpus=corpus, middleware=layers, seed=seed, config=config
         )
